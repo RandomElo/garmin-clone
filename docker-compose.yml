@@ -1,0 +1,23 @@
+services:
+  backend:
+    build: ./backend
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      TZ: ${TZ:-Europe/Paris}
+    volumes:
+      - garmin-data:/data
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    ports:
+      # Fixed port for this machine (8080 is too common: zigbee2mqtt uses it by default)
+      - "4242:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  garmin-data:
