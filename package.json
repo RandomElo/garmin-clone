@@ -1,0 +1,12 @@
+{
+  "name": "foulee",
+  "private": true,
+  "description": "Foulée Android app: build and install helpers",
+  "scripts": {
+    "android": "bash scripts/android.sh run",
+    "android:install": "bash scripts/android.sh install",
+    "android:setup": "bash scripts/android.sh setup",
+    "android:devices": "bash scripts/android.sh devices",
+    "android:logs": "bash scripts/android.sh logs"
+  }
+}

@@ -31,3 +31,20 @@ audits/
 
 # Claude configuration
 .claude/
+
+# Android
+.gradle/
+local.properties
+*.apk
+*.aab
+*.jks
+*.keystore
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Ancienne web app, gardée en local comme référence pour le portage Android
+reference-web/
+
+# Notes de travail (non versionnées)
+docs/notes/

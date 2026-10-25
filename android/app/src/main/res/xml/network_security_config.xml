@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Clear text only for the home Strava server (plain HTTP on the home network or the VPN). Everything else stays HTTPS. -->
+<network-security-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="true">strava.home</domain>
+    </domain-config>
+</network-security-config>
