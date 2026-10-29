@@ -4,6 +4,10 @@ import android.content.Context
 
 /** Garmin tokens (encrypted with the Android Keystore; the password is never stored) and the runs already notified. */
 class Settings(context: Context) {
+    init {
+        NetworkDiagnostic.appContext = context.applicationContext
+    }
+
     private val prefs = context.getSharedPreferences("foulee", Context.MODE_PRIVATE)
 
     // Apart from the main file: signing out wipes that one, and the introduction must not come back for the same person
@@ -52,6 +56,10 @@ class Settings(context: Context) {
     var stravaUrl: String? get() = string("stravaUrl"); set(v) = prefs.edit().putString("stravaUrl", v).apply()
     var stravaKey: String? get() = Secret.decrypt(string("stravaKey")); set(v) = prefs.edit().putString("stravaKey", v?.let(Secret::encrypt)).apply()
     /** Local start ("yyyy-MM-dd HH:mm:ss") after which interval runs get their title and description written on Strava; set when the feature first runs. */
+    /** Runs waiting to show up on Strava, as "activityId:detectedAtMillis" (see [StravaFollowUp]). */
+    var stravaWaiting: Set<String> get() = prefs.getStringSet("stravaWaiting", emptySet()) ?: emptySet(); set(v) = prefs.edit().putStringSet("stravaWaiting", v).apply()
+    /** Titles and descriptions of footings and long runs go by themselves when this is on (the server keeps the Workout label off them, since its version 0.3.0). */
+    var easyTexts: Boolean get() = prefs.getBoolean("easyTexts", true); set(v) = prefs.edit().putBoolean("easyTexts", v).apply()
     var textsSince: String? get() = string("textsSince"); set(v) = prefs.edit().putString("textsSince", v).apply()
     var stravaCursor: String? get() = string("stravaCursor"); set(v) = prefs.edit().putString("stravaCursor", v).apply()
 

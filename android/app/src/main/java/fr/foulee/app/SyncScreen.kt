@@ -2,6 +2,8 @@ package fr.foulee.app
 
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.material3.TextButton
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -88,6 +90,7 @@ private fun StepRow(step: Step) {
                 if (detail != null) Muted(detail, size = 14)
             }
             step.error?.let { Text(it, color = pal.bad, fontSize = 13.sp, lineHeight = 18.sp) }
+            if (step.error == null && step.status == "success") step.note?.let { Muted(it, size = 13) }
         }
     }
 }
@@ -190,7 +193,7 @@ fun SyncSections(state: AppState, snap: Snapshot?) {
                     Muted("${current.progress} %" + (eta?.let { " · encore ~${Fmt.eta(it)}" } ?: ""), size = 14)
                 }
                 ProgressBar(current.progress / 100f, pal.accent, Modifier.padding(top = 4.dp, bottom = 12.dp).fillMaxWidth())
-                current.steps.filter { it.key != "strava" || it.status != "skipped" || it.error != null }.forEach { StepRow(it) }
+                current.steps.filter { (it.key != "strava" && it.key != "detect" && it.key != "texts") || it.status != "skipped" || it.error != null }.forEach { StepRow(it) }
                 Muted("${kind(current.trigger, current.mode)} · ne ferme pas l'appli, tu peux changer d'onglet.", Modifier.padding(top = 8.dp))
             } else if (last != null) {
                 Text(
@@ -242,19 +245,21 @@ fun SyncSections(state: AppState, snap: Snapshot?) {
             }
         }
 
+        DetectionCard(state)
+
         Card(title = "Notification de fin de course") {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Top) {
                 Checkbox(state.autoCheck, { state.toggleAutoCheck(it) })
                 Column(Modifier.padding(start = 4.dp, top = 12.dp)) {
                     Text("Vérification automatique", fontWeight = FontWeight.Medium, color = pal.text)
-                    Muted("Toutes les 15 minutes, l'appli regarde s'il y a une nouvelle course sur Garmin et envoie la notification (distance, allure, forme, fatigue). Décoché, rien ne se lance tout seul.", size = 14)
+                    Muted("Toutes les 5 minutes environ (30 la nuit), l'appli regarde s'il y a une nouvelle course sur Garmin, avec un seul petit appel, et envoie la notification (distance, allure, forme, fatigue). Décoché, rien ne se lance tout seul.", size = 14)
                 }
             }
             OutlinedButton({ state.test() }, Modifier.fillMaxWidth().padding(top = 8.dp), enabled = !state.busy) { Text("Tester avec la dernière course") }
             if (state.message.isNotEmpty()) Muted(state.message, Modifier.padding(top = 8.dp), size = 14)
         }
 
-        Card(title = "Historique") {
+        FoldCard(title = "Historique des synchronisations") {
             if (snap == null || snap.runs.isEmpty()) {
                 Muted("Pas encore d'historique.", size = 14)
             } else {
@@ -274,6 +279,8 @@ fun SyncSections(state: AppState, snap: Snapshot?) {
             }
         }
 
+        JournalCard(state)
+
         Card(title = "Réinitialiser") {
             Muted("Supprime les données locales (activités, santé, historique) puis récupère tout à nouveau depuis Garmin. La connexion est conservée.", size = 14)
             if (confirming) {
@@ -287,5 +294,102 @@ fun SyncSections(state: AppState, snap: Snapshot?) {
         }
 
         OutlinedButton({ state.logout() }, Modifier.fillMaxWidth(), enabled = current == null, colors = ButtonDefaults.outlinedButtonColors(contentColor = pal.bad)) { Text("Se déconnecter de Garmin") }
+    }
+}
+
+
+private fun sourceLabel(source: String) = when (source) {
+    "alarme" -> "alarme 5 min"
+    "travail" -> "tâche 15 min"
+    "garmin" -> "notification Garmin Connect"
+    "garmin-notif" -> "Garmin Connect"
+    else -> source
+}
+
+/** How fast a new run is seen: the measured delay, the last checks, and what makes it faster (battery, Garmin Connect notifications). */
+@Composable
+private fun DetectionCard(state: AppState) {
+    val pal = LocalPal.current
+    val context = androidx.compose.ui.platform.LocalContext.current
+    // Read again every few seconds while the card is on screen
+    val tick by produceState(0) { while (true) { delay(5000); value++ } }
+    val rows = remember(tick) { state.db.detections(30) }
+    val last = remember(tick) { state.db.checks(1).firstOrNull() }
+    val count = remember(tick) { state.db.checkCountSince(System.currentTimeMillis() - 24 * 3600 * 1000L) }
+    val battery = remember(tick) { Detection.batteryUnrestricted(context) }
+    val listened = remember(tick) { Detection.garminListened(context) }
+    val stats = Detection.delayStats(rows)
+
+    FoldCard(title = "Détection des courses") {
+        if (stats == null) {
+            Muted("Pas encore de mesure : à chaque nouvelle course, l'appli note le temps écoulé entre la fin de la séance et le moment où elle la voit sur Garmin.", size = 14)
+        } else {
+            Text("Délai mesuré : médiane ${Math.round(stats.first)} min, 9 courses sur 10 en moins de ${Math.round(stats.second)} min (${rows.size} course${if (rows.size > 1) "s" else ""}).", color = pal.text, fontSize = 14.sp, lineHeight = 20.sp)
+            rows.take(4).forEach { r ->
+                val clock = java.time.format.DateTimeFormatter.ofPattern("HH:mm")
+                fun at(ms: Long) = java.time.Instant.ofEpochMilli(ms).atZone(java.time.ZoneId.systemDefault()).format(clock)
+                Muted("${Fmt.dateTime(r.detectedAt)} · fin ${at(r.endedAt)}, vue ${at(r.detectedAt)} (${Math.round(r.delayMinutes)} min, ${sourceLabel(r.source)})", Modifier.padding(top = 4.dp), size = 12)
+            }
+        }
+        Box(Modifier.padding(vertical = 12.dp).fillMaxWidth().height(1.dp).background(pal.border))
+        Muted(
+            if (last == null) "Aucune vérification en arrière-plan pour l'instant."
+            else "Dernière vérification : ${Fmt.relative(last.at)} (${sourceLabel(last.source)}, ${last.result}) · $count sur 24 h.",
+            size = 14,
+        )
+
+        val notifications = androidx.core.content.ContextCompat.checkSelfPermission(context, android.Manifest.permission.POST_NOTIFICATIONS) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        StatusLine("Notifications de l'appli", notifications, "Réglages") {
+            context.startActivity(android.content.Intent(android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, context.packageName))
+        }
+        StatusLine("Batterie sans restriction", battery, "Autoriser") {
+            context.startActivity(android.content.Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, android.net.Uri.parse("package:${context.packageName}")))
+        }
+        StatusLine("Synchro de Garmin Connect écoutée", listened, "Activer") {
+            context.startActivity(android.content.Intent(android.provider.Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+        }
+        Muted("Écouter Garmin Connect permet de vérifier dès que la montre a fini de se synchroniser, au lieu d'attendre la prochaine ronde. Foulée ne lit aucune notification : elle regarde seulement quand Garmin Connect en poste ou en retire une. Pour que la course arrive vite sur Garmin, mets aussi Garmin Connect en « Sans restriction » dans les réglages de batterie d'Android.", Modifier.padding(top = 8.dp), size = 12)
+    }
+}
+
+@Composable
+private fun StatusLine(label: String, ok: Boolean, action: String, onClick: () -> Unit) {
+    val pal = LocalPal.current
+    Row(Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+        Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
+            Box(Modifier.size(10.dp).clip(CircleShape).background(if (ok) pal.good else pal.warn))
+            Text(label, Modifier.padding(start = 10.dp), color = pal.text, fontSize = 14.sp)
+        }
+        if (!ok) TextButton(onClick) { Text(action, fontSize = 13.sp) }
+    }
+}
+
+
+/** The journal of the app: sync steps, background checks, detections, Strava exchanges and errors, kept two weeks, to copy when something goes wrong. */
+@Composable
+private fun JournalCard(state: AppState) {
+    val pal = LocalPal.current
+    var refresh by remember { mutableStateOf(0) }
+    var onlyProblems by remember { mutableStateOf(false) }
+    var copied by remember { mutableStateOf(false) }
+    val clipboard = androidx.compose.ui.platform.LocalClipboardManager.current
+    val rows by produceState(emptyList<Db.LogRow>(), refresh, onlyProblems) {
+        value = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { state.db.logs(300, onlyProblems) }
+    }
+    fun line(r: Db.LogRow) = "${Fmt.dateTime(r.at)} ${r.level} ${r.tag} : ${r.msg}"
+    FoldCard(title = "Journal") {
+        Muted("Ce que l'appli a fait et les erreurs rencontrées (deux semaines, aucun mot de passe ni clé). À copier pour chercher un bug.", size = 13)
+        // One line, small padding: three buttons side by side must not wrap their words
+        val tight = androidx.compose.foundation.layout.PaddingValues(horizontal = 4.dp)
+        Row(Modifier.fillMaxWidth().padding(vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            OutlinedButton({ refresh++ }, Modifier.weight(1f), contentPadding = tight) { Text("Actualiser", fontSize = 13.sp, maxLines = 1, softWrap = false) }
+            OutlinedButton({ onlyProblems = !onlyProblems }, Modifier.weight(1f), contentPadding = tight) { Text(if (onlyProblems) "Tout" else "Problèmes", fontSize = 13.sp, maxLines = 1, softWrap = false) }
+            OutlinedButton({ clipboard.setText(androidx.compose.ui.text.AnnotatedString(rows.joinToString("\n") { line(it) })); copied = true }, Modifier.weight(1f), contentPadding = tight) { Text(if (copied) "Copié" else "Copier", fontSize = 13.sp, maxLines = 1, softWrap = false) }
+        }
+        if (rows.isEmpty()) Muted("Rien dans le journal pour l'instant.", size = 14)
+        rows.take(60).forEach {
+            Text(line(it), Modifier.padding(vertical = 2.dp), color = when (it.level) { "E" -> pal.bad; "W" -> pal.warn; else -> pal.muted }, fontSize = 11.sp, lineHeight = 15.sp)
+        }
+        if (rows.size > 60) Muted("Les 60 plus récentes sont affichées, « Copier » prend les ${rows.size}.", Modifier.padding(top = 6.dp))
     }
 }

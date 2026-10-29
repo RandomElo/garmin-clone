@@ -51,6 +51,14 @@ object Sync {
     /** Number of activities on Garmin. */
     fun garminTotal(auth: GarminAuth): Int = auth.get("/activitylist-service/activities/count").optInt("totalCount", 0)
 
+    /** A light look at Garmin for the background check: the ids of the latest runs (one small call). */
+    fun recentRunIds(auth: GarminAuth, count: Int = 5): List<Long> {
+        val items = auth.get("/activitylist-service/activities/search/activities?start=0&limit=$count").getJSONArray("items")
+        return (0 until items.length()).map { items.getJSONObject(it) }
+            .filter { it.optJSONObject("activityType")?.optString("typeKey")?.contains("running") == true }
+            .map { it.getLong("activityId") }
+    }
+
     /** The latest activities, or the whole history (up to [MAX_ACTIVITIES]) when [all]. [progress] gets (done, total). */
     fun activities(auth: GarminAuth, db: Db, all: Boolean, total: Int = 0, progress: (Int, Int) -> Unit = { _, _ -> }) {
         val wanted = if (all) min(max(total, 1), MAX_ACTIVITIES) else 20
@@ -130,9 +138,11 @@ object Sync {
             val p = polyline!!.getJSONObject(it)
             if (p.has("lat") && p.has("lon")) p.getDouble("lat") to p.getDouble("lon") else null
         }
-        val detail = ActivityDetail(samples, track, laps)
+        // A lap the watch was not split at (an effort swallowed by the lap after it) is cut out of the curve before anything is computed from the laps
+        val fixed = Intervals.repairLaps(laps, samples) ?: laps
+        val detail = ActivityDetail(samples, track, fixed)
         db.saveDetail(id, detail)
-        db.setIntervalTitle(id, Intervals.analyze(laps, db.recoveryModesOf(id))?.title)
+        db.setIntervalTitle(id, Intervals.analyze(fixed, db.recoveryModesOf(id))?.title)
         val activity = known ?: db.activities().firstOrNull { it.id == id }
         db.setTrimp(id, Insights.trimpFromSamples(samples, activity?.averageHr, activity?.duration, refs))
         return detail

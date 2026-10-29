@@ -4,7 +4,7 @@ import kotlin.math.abs
 import kotlin.math.pow
 
 /** The name and the description the app would put on a Strava interval session. */
-class StravaText(val name: String, val description: String)
+class StravaText(val name: String, val description: String, val interval: Boolean = true)
 
 object StravaTextBuilder {
     /** Race paces in seconds per km (5 km 16:48, 10 km 37:02, half marathon 1:23:48), the marathon from the half with Riegel's formula. */
@@ -30,10 +30,10 @@ object StravaTextBuilder {
         return label.takeIf { abs(pace - ref) / ref <= SPE_TOLERANCE }
     }
 
-    /** 3:21 /km written "3 min 21 /km", like the rest of his Strava texts. */
+    /** 3:21 /km written "3 min 21 / km", like the rest of his Strava texts. */
     private fun pace(speed: Double): String {
         val s = Math.round(1000 / speed).toInt()
-        return "${s / 60} min ${(s % 60).toString().padStart(2, '0')} /km"
+        return "${s / 60} min ${(s % 60).toString().padStart(2, '0')} / km"
     }
 
     private fun repsOf(g: RepGroup) = "${if (g.reps.size > 1) "${g.reps.size} × " else ""}${g.label}"
@@ -53,11 +53,23 @@ object StravaTextBuilder {
             if (recoveries.isNotEmpty()) " ( r : ${recoveries.joinToString(" + ")} )" else "")
         // The recoveries are already in the name: one line per type of effort, with its average pace
         val lines = analysis.groups.map { g -> "${plain(repsOf(g))} : ${pace(g.avgSpeed)}" }
+        return StravaText(name, describe(lines.joinToString("\n"), weekLoad, readiness))
+    }
+
+    /** The two form figures after the lines of the session, then the signature. A figure that is unknown is left out. */
+    private fun describe(lines: String, weekLoad: Double?, readiness: Int?): String {
         val form = listOfNotNull(
             weekLoad?.let { "Charge d'entraînement : ${Fmt.num(it)} / 20" },
             readiness?.let { "Forme du jour : $it / 100" },
         )
-        val description = (listOf(lines.joinToString("\n")) + listOfNotNull(form.takeIf { it.isNotEmpty() }?.joinToString("\n")) + SIGNATURE).joinToString("\n\n")
-        return StravaText(name, description)
+        return (listOf(lines) + listOfNotNull(form.takeIf { it.isNotEmpty() }?.joinToString("\n")) + SIGNATURE).joinToString("\n\n")
+    }
+
+    /** A footing or a long run: just "Footing" (or "Sortie longue") as the name, and the training load as the only figure of the description. */
+    fun buildEasy(a: ActivityRow, weekLoad: Double?, readiness: Int?): StravaText? {
+        if ((a.distance ?: 0.0) <= 0 || (a.duration ?: 0.0) <= 0) return null
+        val kind = if (a.category == "long") "Sortie longue" else "Footing"
+        val description = (listOfNotNull(weekLoad?.let { "Charge d'entraînement : ${Fmt.num(it)} / 20" }) + SIGNATURE).joinToString("\n\n")
+        return StravaText(kind, description, interval = false)
     }
 }

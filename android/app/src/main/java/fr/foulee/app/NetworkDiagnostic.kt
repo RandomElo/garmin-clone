@@ -87,6 +87,26 @@ object NetworkDiagnostic {
         DnsAnswer("injoignable (${e.message ?: e.javaClass.simpleName})", emptyList())
     }
 
+    /** Set by [Settings], so that the code that talks to the server needs no context of its own. */
+    var appContext: Context? = null
+
+    /**
+     * The address of [name] asked straight to the DNS servers of the network in use, when the system resolver gives up (it does so on some
+     * VPN setups whose DNS answers a direct question fine). Null when none of them knows the name.
+     */
+    fun resolveDirect(name: String): String? {
+        fun say(m: String) = StravaSync.settingsLog?.invoke(m)
+        val cm = appContext?.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+        if (cm == null) { say("résolution directe de $name impossible : pas de contexte"); return null }
+        val network = cm.activeNetwork
+        if (network == null) { say("résolution directe de $name impossible : aucun réseau actif"); return null }
+        val servers = cm.getLinkProperties(network)?.dnsServers
+        if (servers.isNullOrEmpty()) { say("résolution directe de $name impossible : le réseau ne donne aucun serveur DNS"); return null }
+        val answers = servers.map { it to ask(it, name, network) }
+        say("DNS interrogés pour $name : " + answers.joinToString(", ") { "${it.first.hostAddress} ${it.second.outcome}" })
+        return answers.firstNotNullOfOrNull { it.second.addresses.firstOrNull() }
+    }
+
     fun run(context: Context, address: String?): DiagReport {
         val url = StravaSync.normalize(address) ?: "http://strava.home"
         val uri = runCatching { java.net.URI(url) }.getOrNull()

@@ -199,7 +199,7 @@ private fun CategoryPicker(state: AppState, a: ActivityRow) {
 /** The actions on the text of a session, in one compact row: copy (a menu), spé and recoveries (dialogs), send. */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun TextActions(state: AppState, a: ActivityRow, analysis: IntervalAnalysis, text: StravaText) {
+private fun TextActions(state: AppState, a: ActivityRow, analysis: IntervalAnalysis?, text: StravaText) {
     val pal = LocalPal.current
     val clipboard = androidx.compose.ui.platform.LocalClipboardManager.current
     var copyMenu by remember { mutableStateOf(false) }
@@ -226,15 +226,15 @@ private fun TextActions(state: AppState, a: ActivityRow, analysis: IntervalAnaly
                 DropdownMenuItem({ Text("Titre et description") }, { copyMenu = false; copy(text.name + "\n\n" + text.description) })
             }
         }
-        OutlinedButton({ speOpen = true }, Modifier.height(36.dp), contentPadding = small) {
+        if (analysis != null) OutlinedButton({ speOpen = true }, Modifier.height(36.dp), contentPadding = small) {
             Text(a.speciality?.takeIf { it != "none" }?.let { "Spé : $it" } ?: "Spé", fontSize = 13.sp)
         }
-        if (analysis.groups.any { it.recovery != null }) OutlinedButton({ recOpen = true }, Modifier.height(36.dp), contentPadding = small) { Text("Récups", fontSize = 13.sp) }
+        if (analysis != null && analysis.groups.any { it.recovery != null }) OutlinedButton({ recOpen = true }, Modifier.height(36.dp), contentPadding = small) { Text("Récups", fontSize = 13.sp) }
         if (a.strava != null && state.stravaConfigured) OutlinedButton({ state.sendText(a) }, Modifier.height(36.dp), contentPadding = small) { Text("Envoyer", fontSize = 13.sp) }
     }
     if (state.stravaConfigured && state.textStatus.isNotEmpty()) Muted(state.textStatus, Modifier.padding(top = 6.dp), size = 12)
-    if (speOpen) SpecialityDialog(state, a, StravaTextBuilder.proposedSpeciality(analysis)) { speOpen = false }
-    if (recOpen) RecoveryDialog(state, a, analysis) { recOpen = false }
+    if (analysis != null && speOpen) SpecialityDialog(state, a, StravaTextBuilder.proposedSpeciality(analysis)) { speOpen = false }
+    if (analysis != null && recOpen) RecoveryDialog(state, a, analysis) { recOpen = false }
 }
 
 /** The race pace of the reps ("Spé 5 km"): proposed from the pace, set only when Eloi taps one. */
@@ -311,9 +311,10 @@ private fun StravaCard(s: StravaActivity) {
 }
 
 @Composable
-private fun IntervalCard(analysis: IntervalAnalysis) {
+private fun IntervalCard(analysis: IntervalAnalysis, notes: List<String> = emptyList()) {
     val pal = LocalPal.current
     FoldCard(title = "Splits de la séance" + if (analysis.structured) " (séance programmée)" else "") {
+        notes.forEach { Text(it, Modifier.padding(bottom = 12.dp), color = pal.warn, fontSize = 13.sp, lineHeight = 18.sp) }
         analysis.groups.forEachIndexed { gi, g ->
             if (gi > 0) Box(Modifier.padding(vertical = 14.dp)) { Divider() }
             Text(
@@ -676,8 +677,12 @@ fun ActivityDetailScreen(state: AppState, snap: Snapshot, opened: ActivityRow, o
         }
 
         // What the app would write on Strava for this session, to read and copy by hand
-        if (a.intervalTitle != null) intervals?.let { iv ->
-            val text = remember(iv, a.recoveryModes, a.speciality, analysis) { StravaTextBuilder.build(iv, analysis.weekLoadOn(a), StravaTexts.readinessOf(a, analysis), a.speciality) }
+        val textCard = if (a.intervalTitle != null) intervals?.let { iv ->
+            remember(iv, a.recoveryModes, a.speciality, analysis) { StravaTextBuilder.build(iv, analysis.weekLoadOn(a), StravaTexts.readinessOf(a, analysis), a.speciality) }
+        } else if (a.isRun && a.category in setOf("easy", "long")) {
+            remember(a.id, a.category, analysis) { StravaTextBuilder.buildEasy(a, analysis.weekLoadOn(a), StravaTexts.readinessOf(a, analysis)) }
+        } else null
+        textCard?.let { text ->
             Card(title = "Texte pour Strava") {
                 androidx.compose.foundation.text.selection.SelectionContainer {
                     Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(pal.track).padding(12.dp)) {
@@ -685,7 +690,7 @@ fun ActivityDetailScreen(state: AppState, snap: Snapshot, opened: ActivityRow, o
                         Text(text.description, Modifier.padding(top = 8.dp), color = pal.muted, fontSize = 12.sp, lineHeight = 17.sp)
                     }
                 }
-                TextActions(state, a, iv, text)
+                TextActions(state, a, if (text.interval) intervals else null, text)
             }
         }
         // Nothing else shows for a moment while the curves and the analysis load from the base
@@ -694,7 +699,7 @@ fun ActivityDetailScreen(state: AppState, snap: Snapshot, opened: ActivityRow, o
             Muted("Chargement…", Modifier.padding(start = 10.dp), size = 14)
         }
         sessionAnalysis?.let { SessionAnalysisCard(it) }
-        intervals?.let { IntervalCard(it) }
+        intervals?.let { iv -> IntervalCard(iv, remember(detail) { detail?.let { Intervals.notes(it.laps, it.samples) } ?: emptyList() }) }
         detail?.let { Curves(it, a) }
         if (a.teLabel != null || a.aerobicTe != null) TrainingEffectCard(a)
         // Kilometer splits mean little on an interval session: the reps table replaces them

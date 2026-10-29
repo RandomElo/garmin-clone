@@ -83,8 +83,15 @@ class FitnessRow(
     val race5k: Double?, val race10k: Double?, val raceHalf: Double?, val raceMarathon: Double?,
 )
 
+class CheckRow(val at: Long, val source: String, val result: String, val newRuns: Int, val ms: Long)
+
+/** [delayMinutes]: from the end of the session to the moment the app saw it on Garmin. */
+class DetectionRow(val activityId: Long, val endedAt: Long, val detectedAt: Long, val source: String) {
+    val delayMinutes get() = (detectedAt - endedAt) / 60_000.0
+}
+
 /** Local copy of what the screens need: activities, curves, laps and one wellness row per day. */
-class Db(context: Context) : SQLiteOpenHelper(context, "foulee.db", null, 11) {
+class Db(context: Context) : SQLiteOpenHelper(context, "foulee.db", null, 13) {
     override fun onCreate(db: SQLiteDatabase) {
         db.execSQL(
             "CREATE TABLE activities (id INTEGER PRIMARY KEY, start_local TEXT NOT NULL, type TEXT NOT NULL, distance REAL, duration REAL, avg_speed REAL, avg_hr REAL, max_hr REAL, " +
@@ -98,6 +105,18 @@ class Db(context: Context) : SQLiteOpenHelper(context, "foulee.db", null, 11) {
         db.execSQL("CREATE TABLE activity_details (id INTEGER PRIMARY KEY, samples TEXT NOT NULL, track TEXT NOT NULL, laps TEXT)")
         createStrava(db)
         createStravaSent(db)
+        createDetection(db)
+        createLog(db)
+    }
+
+    /** How fast a new run is seen: every background check, and for each run the end of the session against the moment it was detected. */
+    private fun createLog(db: SQLiteDatabase) {
+        db.execSQL("CREATE TABLE app_log (id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, level TEXT NOT NULL, tag TEXT NOT NULL, msg TEXT NOT NULL)")
+    }
+
+    private fun createDetection(db: SQLiteDatabase) {
+        db.execSQL("CREATE TABLE checks (id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, source TEXT NOT NULL, result TEXT NOT NULL, new_runs INTEGER NOT NULL DEFAULT 0, ms INTEGER NOT NULL DEFAULT 0)")
+        db.execSQL("CREATE TABLE detections (activity_id INTEGER PRIMARY KEY, ended_at INTEGER NOT NULL, detected_at INTEGER NOT NULL, source TEXT NOT NULL)")
     }
 
     /** What the "Vérifier Strava" check has already sent for real: only the changes are sent again. Key: "s<stravaId>" or "g<garminId>". */
@@ -146,6 +165,8 @@ class Db(context: Context) : SQLiteOpenHelper(context, "foulee.db", null, 11) {
         if (oldVersion < 9) createStravaSent(db)
         if (oldVersion < 10) db.execSQL("ALTER TABLE activities ADD COLUMN recovery_modes TEXT")
         if (oldVersion < 11) db.execSQL("ALTER TABLE activities ADD COLUMN speciality TEXT")
+        if (oldVersion < 12) createDetection(db)
+        if (oldVersion < 13) createLog(db)
     }
 
     /** Updates what the Garmin list sends and keeps the locally computed columns (interval title, manual kind, TRIMP). */
@@ -350,6 +371,11 @@ class Db(context: Context) : SQLiteOpenHelper(context, "foulee.db", null, 11) {
     }
 
     /** Activities whose curves and laps are both stored (a detail with only laps, or without laps, counts as missing). */
+    /** Forgets the curves and laps of one activity: the next sync fetches them again. */
+    fun deleteDetail(id: Long) {
+        writableDatabase.delete("activity_details", "id = ?", arrayOf(id.toString()))
+    }
+
     fun detailIds(): Set<Long> = readableDatabase.rawQuery("SELECT id FROM activity_details WHERE laps IS NOT NULL AND samples != '[]'", null).use { c -> generateSequence { if (c.moveToNext()) c.getLong(0) else null }.toSet() }
 
     /** Activities whose laps are stored, with or without curves. */
@@ -407,5 +433,46 @@ class Db(context: Context) : SQLiteOpenHelper(context, "foulee.db", null, 11) {
         writableDatabase.execSQL("DELETE FROM daily")
         writableDatabase.execSQL("DELETE FROM strava_activities")
         writableDatabase.execSQL("DELETE FROM strava_sent")
+        writableDatabase.execSQL("DELETE FROM checks")
+        writableDatabase.execSQL("DELETE FROM detections")
+    }
+
+    /** One line of the journal of the app: what happened, when, with which result. Never a password, a token or a key. */
+    fun addLog(level: String, tag: String, msg: String) {
+        android.util.Log.println(if (level == "E") android.util.Log.ERROR else if (level == "W") android.util.Log.WARN else android.util.Log.INFO, "Foulee/$tag", msg)
+        try {
+            val db = writableDatabase
+            db.insert("app_log", null, ContentValues().apply { put("at", System.currentTimeMillis()); put("level", level); put("tag", tag); put("msg", msg.take(600)) })
+            // Two weeks and 3000 lines at most
+            db.execSQL("DELETE FROM app_log WHERE at < ? OR id NOT IN (SELECT id FROM app_log ORDER BY id DESC LIMIT 3000)", arrayOf<Any>(System.currentTimeMillis() - 14L * 86_400_000))
+        } catch (_: Exception) {
+        }
+    }
+
+    class LogRow(val at: Long, val level: String, val tag: String, val msg: String)
+
+    fun logs(limit: Int = 150, onlyProblems: Boolean = false): List<LogRow> = readableDatabase.rawQuery(
+        "SELECT at, level, tag, msg FROM app_log ${if (onlyProblems) "WHERE level != 'I'" else ""} ORDER BY id DESC LIMIT $limit", null,
+    ).use { c -> generateSequence { if (c.moveToNext()) LogRow(c.getLong(0), c.getString(1), c.getString(2), c.getString(3)) else null }.toList() }
+
+    fun addCheck(at: Long, source: String, result: String, newRuns: Int, ms: Long) {
+        val db = writableDatabase
+        db.insert("checks", null, ContentValues().apply { put("at", at); put("source", source); put("result", result); put("new_runs", newRuns); put("ms", ms) })
+        // The journal only needs the recent past
+        db.execSQL("DELETE FROM checks WHERE id NOT IN (SELECT id FROM checks ORDER BY id DESC LIMIT 1000)")
+    }
+
+    fun checks(limit: Int = 10): List<CheckRow> = readableDatabase.rawQuery("SELECT at, source, result, new_runs, ms FROM checks ORDER BY id DESC LIMIT $limit", null).use { c ->
+        generateSequence { if (c.moveToNext()) CheckRow(c.getLong(0), c.getString(1), c.getString(2), c.getInt(3), c.getLong(4)) else null }.toList()
+    }
+
+    fun checkCountSince(since: Long): Int = readableDatabase.rawQuery("SELECT COUNT(*) FROM checks WHERE at >= ? AND source != 'garmin-notif'", arrayOf(since.toString())).use { it.moveToFirst(); it.getInt(0) }
+
+    fun addDetection(activityId: Long, endedAt: Long, detectedAt: Long, source: String) {
+        writableDatabase.insertWithOnConflict("detections", null, ContentValues().apply { put("activity_id", activityId); put("ended_at", endedAt); put("detected_at", detectedAt); put("source", source) }, SQLiteDatabase.CONFLICT_IGNORE)
+    }
+
+    fun detections(limit: Int = 30): List<DetectionRow> = readableDatabase.rawQuery("SELECT activity_id, ended_at, detected_at, source FROM detections ORDER BY detected_at DESC LIMIT $limit", null).use { c ->
+        generateSequence { if (c.moveToNext()) DetectionRow(c.getLong(0), c.getLong(1), c.getLong(2), c.getString(3)) else null }.toList()
     }
 }

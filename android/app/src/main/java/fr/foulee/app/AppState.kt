@@ -24,7 +24,7 @@ class Snapshot(
 private const val DATA_VERSION = 7
 
 /** Raise it when the interval detection changes: the titles stored in the base are rebuilt from the stored laps. */
-private const val TITLES_VERSION = 5
+private const val TITLES_VERSION = 13
 
 class AppState(private val context: Context) {
     private val settings = Settings(context)
@@ -179,14 +179,51 @@ class AppState(private val context: Context) {
         }
     }
 
+    /** State of the link with the server, for the small tile of the profile: "unknown", "checking", "ok", "session" (server up, Strava session lost) or "down". */
+    var stravaLink by mutableStateOf("unknown")
+    var stravaLinkDetail by mutableStateOf("")
+    var stravaLinkAt by mutableStateOf(0L)
+    var stravaEtat by mutableStateOf<StravaSync.Etat?>(null)
+
+    /** A silent check of the saved address and key: only the tile changes. */
+    fun pingStrava() {
+        if (!stravaConfigured || stravaLink == "checking") return
+        stravaLink = "checking"
+        StravaSync.settingsLog = { db.addLog("W", "strava", it) }
+        thread {
+            try {
+                val answer = StravaSync.test(stravaUrl, settings.stravaKey)
+                stravaEtat = StravaSync.etat(settings)
+                stravaLink = if (answer.startsWith("Serveur joint")) "ok" else "session"
+                stravaLinkDetail = answer
+                if (stravaLink == "ok") stravaWorked()
+            } catch (e: Exception) {
+                stravaLink = "down"
+                stravaLinkDetail = e.message ?: e.javaClass.simpleName
+            }
+            stravaLinkAt = System.currentTimeMillis()
+            db.addLog(if (stravaLink == "ok") "I" else "W", "strava", "test du serveur : $stravaLink ($stravaLinkDetail)" + (stravaEtat?.let { " · v${it.version}, écriture ${if (it.writing) "active" else "en simulation"}, session ${it.session}" } ?: ""))
+        }
+    }
+
     fun testStrava(url: String, key: String) {
         if (stravaBusy) return
         stravaBusy = true
         stravaMessage = "Test en cours…"
+        StravaSync.settingsLog = { db.addLog("W", "strava", it) }
         thread {
             stravaMessage = try {
-                StravaSync.test(url, key.ifBlank { settings.stravaKey }).also { stravaWorked() }
+                StravaSync.test(url, key.ifBlank { settings.stravaKey }).also {
+                    // The pill in the card header follows this test too, so the two never disagree
+                    stravaLink = if (it.startsWith("Serveur joint")) "ok" else "session"
+                    stravaLinkDetail = it
+                    stravaLinkAt = System.currentTimeMillis()
+                    if (stravaLink == "ok") stravaWorked()
+                }
             } catch (e: Exception) {
+                stravaLink = "down"
+                stravaLinkDetail = e.message ?: e.javaClass.simpleName
+                stravaLinkAt = System.currentTimeMillis()
                 e.message ?: e.javaClass.simpleName
             }
             stravaBusy = false
@@ -225,41 +262,49 @@ class AppState(private val context: Context) {
     /** What the last sending of titles and descriptions did, shown in the Strava card. */
     var textStatus by mutableStateOf("")
     private val pushing = java.util.concurrent.atomic.AtomicBoolean(false)
-    // In simulation nothing is remembered as sent: this keeps the same text from going again at every reload
-    private val simulated = mutableSetOf<String>()
 
-    /** New interval runs: their title and description go to the Strava server (only runs after the day the feature started). */
+    /** New runs: their title and description go to the Strava server (only runs after the day the feature started). */
     private fun pushTexts() {
-        val snap = snapshot ?: return
-        if (settings.stravaUrl.isNullOrBlank() || !hasStravaKey || !pushing.compareAndSet(false, true)) return
         try {
-            val since = settings.textsSince ?: run {
-                settings.textsSince = java.time.LocalDateTime.now().format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))
-                return
-            }
-            val items = StravaTexts.pending(db, snap, since).filter { "${it.key}:${it.hash}" !in simulated }
-            if (items.isEmpty()) return
-            val outcome = StravaTexts.send(settings, db, items)
-            stravaWorked()
-            if (outcome.simulation) items.forEach { simulated += "${it.key}:${it.hash}" }
-            textStatus = "Textes des nouveaux fractionnés : " + StravaTexts.summary(outcome)
+            StravaTexts.push(settings, db)?.let { stravaWorked(); textStatus = it }
         } catch (e: Exception) {
-            textStatus = "Textes des nouveaux fractionnés : " + (e.message ?: e.javaClass.simpleName)
-        } finally {
-            pushing.set(false)
+            db.addLog("E", "strava", "envoi des textes : ${e.javaClass.simpleName}: ${e.message}")
+            textStatus = "Textes des nouvelles séances : " + (e.message ?: e.javaClass.simpleName)
         }
+    }
+
+    var easyTexts by mutableStateOf(settings.easyTexts)
+    fun chooseEasyTexts(on: Boolean) { settings.easyTexts = on; easyTexts = on; db.addLog("I", "strava", "textes automatiques des footings : ${if (on) "activés" else "désactivés"}") }
+
+    /** The text of the latest session already matched with its Strava outing, for the test of the modification. Null when there is none. */
+    fun textTestCandidate(): TextItem? {
+        val snap = snapshot ?: return null
+        return snap.activities.filter { it.id > 0 && it.isRun && it.strava != null }.take(12).firstNotNullOfOrNull { StravaTexts.single(db, snap, it) }
     }
 
     /** "Envoyer à Strava" on one session, whatever its date. */
     fun sendText(a: ActivityRow) {
-        val snap = snapshot ?: return
         if (!pushing.compareAndSet(false, true)) return
         textStatus = "Envoi en cours…"
         thread {
             textStatus = try {
-                val item = StravaTexts.single(db, snap, a) ?: throw StravaError("Cette séance n'est pas encore associée à une sortie Strava.")
-                StravaTexts.send(settings, db, listOf(item)).also { stravaWorked() }.let { StravaTexts.summary(it) }
+                StravaSync.settingsLog = { db.addLog("W", "strava", it) }
+                // The outing may have appeared on Strava since the last sync: ask the server again before giving up
+                runCatching { StravaSync.run(settings, db) }
+                val fresh = db.activities().firstOrNull { it.id == a.id } ?: a
+                val item = snapshot?.let { StravaTexts.single(db, it, fresh) }
+                    ?: db.activities().firstOrNull { it.id == a.id }?.let { row -> StravaTexts.single(db, build(db.activities().sortedByDescending { it.startLocal }), row) }
+                if (item == null) {
+                    if (fresh.strava == null) {
+                        StravaFollowUp.start(context, listOf(a.id))
+                        "Cette course n'est pas encore sur Strava : je réessaie chaque minute pendant 45 min et j'envoie le texte dès qu'elle y est."
+                    } else "Cette séance n'a pas de texte à envoyer (ni fractionné, ni footing, ni sortie longue)."
+                } else {
+                    val outcome = StravaTexts.send(settings, db, listOf(item)).also { stravaWorked() }
+                    StravaTexts.summary(outcome) + StravaTexts.verifySummary(StravaTexts.verify(settings, db, outcome))
+                }
             } catch (e: Exception) {
+                db.addLog("E", "strava", "envoi de ${a.id} : ${e.javaClass.simpleName}: ${e.message}")
                 e.message ?: e.javaClass.simpleName
             } finally {
                 pushing.set(false)
@@ -269,6 +314,13 @@ class AppState(private val context: Context) {
 
     private fun refreshTitles() {
         if (settings.titlesVersion >= TITLES_VERSION) return
+        // Version 12 cut an effort too short on one session: its laps are fetched again from Garmin by the next sync
+        if (settings.titlesVersion == 12) for (id in db.detailIds()) if (db.detail(id)?.laps?.any { it.stepIndex == Intervals.APP_SPLIT } == true) db.deleteDetail(id)
+        // Sessions already on the phone: cut the efforts the watch did not split, once
+        for (id in db.detailIds()) {
+            val d = db.detail(id) ?: continue
+            Intervals.repairLaps(d.laps, d.samples)?.let { db.saveLaps(id, it) }
+        }
         val laps = db.lapsOf(db.lapIds())
         for ((id, l) in laps) db.setIntervalTitle(id, Intervals.analyze(l, db.recoveryModesOf(id))?.title)
         settings.titlesVersion = TITLES_VERSION
@@ -341,14 +393,14 @@ class AppState(private val context: Context) {
     private fun afterLogin() {
         loggedIn = true
         message = ""
-        if (settings.autoCheck) RunCheckWorker.schedule(context)
+        if (settings.autoCheck) Detection.schedule(context)
         sync("full", "login")
     }
 
     fun toggleAutoCheck(on: Boolean) {
         settings.autoCheck = on
         autoCheck = on
-        if (on) RunCheckWorker.schedule(context) else RunCheckWorker.cancel(context)
+        if (on) Detection.schedule(context) else Detection.cancel(context)
     }
 
     fun test() = action("Envoi de la notification de test…") {
@@ -369,7 +421,7 @@ class AppState(private val context: Context) {
     }
 
     fun logout() {
-        RunCheckWorker.cancel(context)
+        Detection.cancel(context)
         db.clear()
         settings.clear()
         loggedIn = false
@@ -387,6 +439,7 @@ class AppState(private val context: Context) {
             try {
                 block()
             } catch (e: Exception) {
+                db.addLog("E", "action", "$label : ${e.javaClass.simpleName}: ${e.message}")
                 message = "Erreur : ${e.message ?: e.javaClass.simpleName}"
             } finally {
                 busy = false

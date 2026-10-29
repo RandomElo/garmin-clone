@@ -66,7 +66,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         val state = AppState(applicationContext)
-        if (state.loggedIn) RunCheckWorker.schedule(this)
+        if (state.loggedIn && Settings(applicationContext).autoCheck) Detection.schedule(this)
         setContent {
             FouleeTheme {
                 LaunchedEffect(Unit) { state.start() }

@@ -111,6 +111,29 @@ object Intervals {
 
     private fun nearestMultiple(v: Double, step: Int) = (v / step).roundToInt() * step.toDouble()
 
+    /** A timed effort ends a second or so from a round time (30, 45, 60 s…), whatever distance it covered. */
+    private const val TIMED_TOLERANCE = 1.5
+    private fun timedKey(l: Lap): Double? {
+        val d = l.duration ?: return null
+        val key = nearestMultiple(d, 15)
+        return key.takeIf { d >= 15 && abs(d - key) <= TIMED_TOLERANCE }
+    }
+
+    /**
+     * A session of timed efforts (6 × 1 min + 6 × 45 s + 6 × 30 s): nearly every effort ends on a round time and few sit on a round
+     * distance. The watch cut the laps by time, so the distances (300, 200, 150 m…) only follow the pace and must not make the types.
+     */
+    private fun isTimedSession(work: List<LapInfo>): Boolean {
+        if (work.size < 4 || work.count { timedKey(it.lap) != null } < work.size * 0.9) return false
+        val clusters = work.filter { timedKey(it.lap) != null }.groupBy { timedKey(it.lap)!! }
+        // Several round times; and in each one the distances wander (a few %): 1000 m run in 4:00 flat have steady distances, those are distance reps
+        return clusters.size >= 2 && clusters.values.filter { it.size >= 3 }.all { cv(it.map { l -> l.lap.distance ?: 0.0 }) >= 0.025 }
+    }
+
+    /** Several efforts of one type that all end on a round time while their distances wander: timed efforts (6 × 1 min, 6 × 45 s). */
+    private fun timedReps(durations: List<Double>, distances: List<Double>) =
+        durations.size > 1 && durations.all { abs(it - nearestMultiple(it, 15)) <= TIMED_TOLERANCE } && cv(durations) < cv(distances) && !distances.all { onRoundDistance(it) }
+
     /** The watch ends a timed step on a round number of seconds, a measured one on a round distance. */
     private fun isRoundTime(t: Double) = t >= 15 && abs(t - nearestMultiple(t, 15)) <= 3.5
 
@@ -182,17 +205,131 @@ object Intervals {
     }
 
     /** The label of a type of efforts ("1000 m", "1 min 30"): timed when their durations are round and steadier than their distances. */
-    private fun effortLabel(reps: List<LapInfo>): String {
+    private fun effortLabel(reps: List<LapInfo>, timedSession: Boolean): String {
         val durations = reps.map { it.lap.duration!! }
         val distances = reps.map { it.lap.distance!! }
-        val roundDurations = durations.all { abs(it - (it / 15).roundToInt() * 15) <= 1 }
-        val timeBased = reps.size > 1 && roundDurations && cv(durations) < cv(distances) && !distances.all { onRoundDistance(it) }
-        return if (timeBased) nominalDuration(mean(durations)) else nominalDistance(mean(distances))
+        return if (timedSession || timedReps(durations, distances)) nominalDuration(mean(durations)) else nominalDistance(mean(distances))
     }
 
     private fun nominalRecoveryDistance(d: Double) = if (d < 950) "${nearest50(d).roundToInt()}${NBSP}m" else nominalDistance(d)
 
     private fun value(l: Lap, measured: Boolean) = if (measured) l.distance!! else l.duration!!
+
+    /** Marks a lap the app cut itself out of a longer one (the watch was not split there). */
+    const val APP_SPLIT = -7
+
+    /**
+     * The watch was not split at the end of an effort: its lap swallowed the next effort (a long "recovery" lap with a burst of speed inside).
+     * The burst is found on the speed curve and cut out as an effort of its own, with the duration of the efforts it looks like.
+     * Only laps of a session already seen as intervals are touched, and nothing about pauses or stops is used to change a pace.
+     * Returns the new laps, or null when nothing had to be cut.
+     */
+    fun repairLaps(laps: List<Lap>, samples: List<Sample>): List<Lap>? {
+        if (laps.any { it.distance == null || (it.duration ?: 0.0) <= 0 } || laps.any { it.stepIndex == APP_SPLIT }) return null
+        val analysis = analyze(laps)?.takeIf { !it.structured } ?: return null
+        val work = analysis.laps.filter { it.role == LapRole.WORK }.map { it.lap }
+        if (work.size < 4) return null
+        val medianDuration = median(work.map { it.duration!! })
+        val threshold = 0.92 * median(work.map { speedOf(it) })
+        val points = samples.filter { it.d != null && it.t != null && it.speed != null }
+        if (points.size < 10) return null
+
+        val out = mutableListOf<Lap>()
+        var startD = 0.0
+        var changed = false
+        analysis.laps.forEach { info ->
+            val lap = info.lap
+            val endD = startD + lap.distance!!
+            val long = info.role != LapRole.WORK && lap.duration!! >= maxOf(2.5 * medianDuration, 90.0)
+            val bursts = if (long) burstsIn(points.filter { it.d!! > startD && it.d <= endD }, threshold, work) else emptyList()
+            if (bursts.isEmpty()) {
+                out += lap
+            } else {
+                changed = true
+                var cursor = startD
+                var restDuration = lap.duration!!
+                for (b in bursts) {
+                    val pre = b.startD - cursor
+                    if (pre >= 20) {
+                        val preDuration = lap.duration!! * pre / lap.distance
+                        out += Lap(pre, preDuration, pre / preDuration, lap.averageHr, lap.maxHr, null, null, null)
+                        restDuration -= preDuration
+                    }
+                    out += Lap(b.endD - b.startD, b.duration, (b.endD - b.startD) / b.duration, b.hr, b.maxHr, null, null, APP_SPLIT)
+                    restDuration -= b.duration
+                    cursor = b.endD
+                }
+                val rest = endD - cursor
+                if (rest >= 20 && restDuration > 5) out += Lap(rest, restDuration, rest / restDuration, lap.averageHr, lap.maxHr, null, null, null)
+            }
+            startD = endD
+        }
+        return if (changed) out else null
+    }
+
+    private class Burst(val startD: Double, val endD: Double, val duration: Double, val hr: Double?, val maxHr: Double?)
+
+    /** Stretches of the curve at the pace of the efforts, lasting about as long as one of them. */
+    private fun burstsIn(points: List<Sample>, threshold: Double, work: List<Lap>): List<Burst> {
+        val shortest = work.minOf { it.duration!! }
+        val longest = work.maxOf { it.duration!! }
+        val found = mutableListOf<Burst>()
+        var from = -1
+        fun close(toIndex: Int) {
+            if (from < 0) return
+            // The start and the end of an effort are slower than its middle: keep the neighbours that are close to the pace
+            var first = from
+            var to = toIndex
+            while (first > 0 && toIndex - first < 40 && from - first < 2 && points[first - 1].speed!! >= 0.75 * threshold) first--
+            while (to < points.lastIndex && to - toIndex < 2 && points[to + 1].speed!! >= 0.75 * threshold) to++
+            val run = points.subList(first, to + 1)
+            val span = run.last().t!! - run.first().t!!
+            val step = if (run.size > 1) span / (run.size - 1) else 4.0
+            val seconds = span + step
+            from = -1
+            if (seconds < maxOf(15.0, 0.6 * shortest) || seconds > 1.5 * longest) return
+            // The duration is the one of the efforts it looks like (28 s on the curve: a 30 s effort)
+            val like = work.map { it.duration!! }.minByOrNull { abs(it - seconds) }!!
+            val duration = if (abs(like - seconds) / like <= 0.25) like else seconds
+            val hrs = run.mapNotNull { it.hr }
+            found += Burst(run.first().d!!, run.last().d!!, duration, hrs.takeIf { it.isNotEmpty() }?.average(), hrs.maxOrNull())
+        }
+        points.forEachIndexed { i, p ->
+            val fast = p.speed!! >= threshold
+            val gap = if (i > 0) p.t!! - points[i - 1].t!! else 0.0
+            if (from >= 0 && (!fast || gap > 10)) close(i - 1)
+            if (fast && from < 0) from = i
+        }
+        close(points.lastIndex)
+        return found.take(3)
+    }
+
+    /**
+     * Remarks about what the watch recorded, for the session card: efforts the app had to cut out of a long lap, and a watch that was not
+     * stopped after the session (a pause, then another run at a calmer pace in the same recording). Nothing here changes any figure.
+     */
+    fun notes(laps: List<Lap>, samples: List<Sample>): List<String> {
+        val out = mutableListOf<String>()
+        val cut = laps.filter { it.stepIndex == APP_SPLIT }
+        if (cut.isNotEmpty()) out += "La montre n'a pas été découpée à ${if (cut.size > 1) "${cut.size} efforts" else "un effort"} (${cut.joinToString(", ") { nominalDuration(it.duration!!) }}) : ${if (cut.size > 1) "retrouvés" else "retrouvé"} sur la courbe d'allure et ajouté${if (cut.size > 1) "s" else ""} aux répétitions."
+        val analysis = analyze(laps) ?: return out
+        val work = analysis.laps.filter { it.role == LapRole.WORK }
+        if (work.isEmpty()) return out
+        val lastWork = work.last()
+        val endD = analysis.laps.takeWhile { it !== lastWork }.sumOf { it.lap.distance ?: 0.0 } + (lastWork.lap.distance ?: 0.0)
+        val points = samples.filter { it.d != null && it.t != null && it.speed != null && it.d > endD }
+        // A pause (speed at zero for several seconds) after at least a minute of cooldown, then a real run of 4 minutes or more
+        val stopAt = points.indices.firstOrNull { i ->
+            val j = (i until points.size).firstOrNull { points[it].speed!! >= 0.3 } ?: points.size
+            points[i].speed!! < 0.3 && (i == 0 || points[i - 1].speed!! >= 0.3) && j > i + 1 && points[i].t!! - points.first().t!! >= 60 && j < points.size &&
+                points.last().t!! - points[j].t!! >= 240 && points.subList(j, points.size).count { it.speed!! >= 1.5 } >= (points.size - j) * 0.9
+        } ?: return out
+        val after = points.subList((stopAt until points.size).first { points[it].speed!! >= 0.3 }, points.size)
+        val meters = after.last().d!! - after.first().d!!
+        val seconds = after.last().t!! - after.first().t!!
+        if (meters > 500 && seconds > 0) out += "La montre n'a pas été arrêtée après le fractionné : après le retour au calme et une pause, ${Fmt.km(meters)} ont continué à ${Fmt.pace(meters / seconds)}. C'est une autre sortie dans le même enregistrement."
+        return out
+    }
 
     /**
      * [recoveryModes]: what Eloi chose by hand, by label of the efforts ("200 m", "1 min"): true = the recoveries of that type are
@@ -205,9 +342,12 @@ object Intervals {
         val tagged = structuredRoles(usable)
         val roles = tagged ?: inferredRoles(usable) ?: return null
         val infos = usable.mapIndexed { i, lap -> LapInfo(lap, roles[i]) }
+        // Efforts of 5 km or more only are a long steady run cut in a few pieces, not an interval session
+        if (infos.filter { it.role == LapRole.WORK }.all { (it.lap.distance ?: 0.0) >= 5000 }) return null
 
-        // Group efforts: by workout step when known, otherwise by similar distance
-        class Bucket(val step: Int?, val roundKey: Double?, val distances: MutableList<Double> = mutableListOf(), val reps: MutableList<LapInfo> = mutableListOf())
+        val timedSession = tagged == null && isTimedSession(infos.filter { it.role == LapRole.WORK })
+        // Group efforts: by workout step when known, otherwise by similar distance (or by round time in a timed session)
+        class Bucket(val step: Int?, val roundKey: Double?, val timedKey: Double?, val distances: MutableList<Double> = mutableListOf(), val reps: MutableList<LapInfo> = mutableListOf())
         // Reps on a round distance are the same type only on the same round distance (1000 m and 1100 m are not); the others by similarity
         fun sameType(b: Bucket, d: Double): Boolean {
             if (b.roundKey != null && onRoundDistance(d)) return roundDistance(d) == b.roundKey
@@ -218,9 +358,12 @@ object Intervals {
             if (info.role != LapRole.WORK) continue
             val d = info.lap.distance!!
             val step = if (tagged != null) info.lap.stepIndex else null
-            var bucket = if (step != null) buckets.firstOrNull { it.step == step } else buckets.firstOrNull { it.step == null && sameType(it, d) }
+            // Efforts that end on a round time are one type per time (6 × 1 min, 6 × 45 s), even when the distances differ by 10 %
+            val timed = if (step == null && timedSession) timedKey(info.lap) else null
+            var bucket = if (step != null) buckets.firstOrNull { it.step == step }
+            else buckets.firstOrNull { it.step == null && if (timed != null) it.timedKey == timed else it.timedKey == null && sameType(it, d) }
             if (bucket == null) {
-                bucket = Bucket(step, if (onRoundDistance(d)) roundDistance(d) else null)
+                bucket = Bucket(step, if (onRoundDistance(d)) roundDistance(d) else null, timed)
                 buckets += bucket
             }
             bucket.distances += d
@@ -230,7 +373,7 @@ object Intervals {
         }
 
         // Efforts are grouped first: the recoveries of one group follow the same rule (timed or measured)
-        val recoveryKinds = classifyRecoveries(infos, buckets.map { effortLabel(it.reps) }, recoveryModes)
+        val recoveryKinds = classifyRecoveries(infos, buckets.map { effortLabel(it.reps, timedSession) }, recoveryModes)
 
         fun describeRecovery(laps: List<LapInfo>, kinds: List<RecoveryKind>): Recovery {
             val durations = laps.map { it.lap.duration!! }
@@ -245,8 +388,7 @@ object Intervals {
             val durations = reps.map { it.lap.duration!! }
             val distances = reps.map { it.lap.distance!! }
             // Timed reps (e.g. 30 s / 30 s): durations sit on round values and vary less than distances
-            val roundDurations = durations.all { abs(it - (it / 15).roundToInt() * 15) <= 1 }
-            val timeBased = reps.size > 1 && roundDurations && cv(durations) < cv(distances) && !distances.all { onRoundDistance(it) }
+            val timeBased = timedSession || timedReps(durations, distances)
             val speeds = reps.map { speedOf(it.lap) }
             val hrs = reps.mapNotNull { it.lap.averageHr }
             // Recovery = the recovery lap right after each rep

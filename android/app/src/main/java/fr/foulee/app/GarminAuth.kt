@@ -23,6 +23,8 @@ class GarminAuth(context: Context) {
     }
 
     fun login(email: String, password: String): Login {
+        // The OAuth consumer key comes from another host: fetch it while the two sign-in requests run
+        prefetchConsumer()
         Http.request("GET", "$SSO/mobile/sso/en/sign-in?clientId=$CLIENT_ID", pageHeaders())
         val body = JSONObject().put("username", email).put("password", password).put("rememberMe", false).put("captchaToken", "")
         val response = Http.request("POST", "$SSO/mobile/api/login?$loginQuery", jsonHeaders(), body.toString())
@@ -116,10 +118,15 @@ class GarminAuth(context: Context) {
         settings.accessExpiresAt = System.currentTimeMillis() / 1000 + json.optLong("expires_in", 3600)
     }
 
+    @Synchronized
     private fun consumer(): Pair<String, String> {
         cachedConsumer?.let { return it }
         val json = JSONObject(Http.request("GET", CONSUMER_URL).body)
         return (json.getString("consumer_key") to json.getString("consumer_secret")).also { cachedConsumer = it }
+    }
+
+    private fun prefetchConsumer() {
+        if (cachedConsumer == null) kotlin.concurrent.thread { runCatching { consumer() } }
     }
 
     /** OAuth 1.0 HMAC-SHA1 Authorization header; query and form parameters are part of the signature. */

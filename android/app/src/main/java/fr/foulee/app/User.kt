@@ -1,5 +1,12 @@
 package fr.foulee.app
 
+import androidx.compose.material3.Icon
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Block
+import androidx.compose.material.icons.filled.Cancel
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Sync
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.foundation.background
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -163,6 +170,24 @@ private fun DimensionDialog(d: Dimension, onClose: () -> Unit) {
     )
 }
 
+/** The small pill in the header of the Strava card: whether the server answers, readable while the card is folded. */
+@Composable
+private fun StravaLinkPill(state: AppState) {
+    val pal = LocalPal.current
+    val (color, label, icon) = when (if (state.stravaConfigured) state.stravaLink else "none") {
+        "ok" -> Triple(pal.good, "Connecté", Icons.Filled.CheckCircle)
+        "session" -> Triple(pal.warn, "Session perdue", Icons.Filled.Warning)
+        "down" -> Triple(pal.bad, "Injoignable", Icons.Filled.Cancel)
+        "checking" -> Triple(pal.neutral, "Vérification…", Icons.Filled.Sync)
+        "none" -> Triple(pal.neutral, "Non configuré", Icons.Filled.Block)
+        else -> Triple(pal.neutral, "…", Icons.Filled.Sync)
+    }
+    Row(Modifier.clip(RoundedCornerShape(50)).background(color.copy(alpha = 0.15f)).padding(horizontal = 10.dp, vertical = 3.dp), verticalAlignment = Alignment.CenterVertically) {
+        Icon(icon, null, Modifier.size(14.dp), tint = color)
+        Text(label, Modifier.padding(start = 5.dp), color = color, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+    }
+}
+
 /** The home Strava server: optional, the detection of the kind of run works without it. */
 @Composable
 private fun StravaCard(state: AppState, onOpen: (ActivityRow) -> Unit) {
@@ -173,7 +198,28 @@ private fun StravaCard(state: AppState, onOpen: (ActivityRow) -> Unit) {
     val context = androidx.compose.ui.platform.LocalContext.current
     state.diagReport?.let { DiagnosticDialog(it) { state.diagReport = null } }
     state.checkReport?.let { LabelReviewDialog(state, it, onOpen) { state.closeReview() } }
-    FoldCard(title = "Serveur Strava") {
+    androidx.compose.runtime.LaunchedEffect(state.stravaConfigured) { state.pingStrava() }
+    var testText by remember { mutableStateOf<TextItem?>(null) }
+    var testNone by remember { mutableStateOf(false) }
+    testText?.let { item ->
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { testText = null },
+            containerColor = pal.card, titleContentColor = pal.text, textContentColor = pal.text,
+            title = { Text("Écrire sur Strava ?", fontWeight = FontWeight.SemiBold) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Muted("Sortie du ${Fmt.date(item.activity.startLocal)}. Le serveur écrit sur ton compte Strava, sauf si la sortie a déjà une description à toi.", size = 13)
+                    Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(pal.track).padding(12.dp)) {
+                        Text(item.text.name, color = pal.text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                        Text(item.text.description, Modifier.padding(top = 6.dp), color = pal.muted, fontSize = 12.sp, lineHeight = 17.sp)
+                    }
+                }
+            },
+            confirmButton = { TextButton({ state.sendText(item.activity); testText = null }) { Text("Envoyer") } },
+            dismissButton = { TextButton({ testText = null }) { Text("Annuler") } },
+        )
+    }
+    FoldCard(title = "Serveur Strava", badge = { StravaLinkPill(state) }) {
         Muted("Facultatif. Le serveur donne le nom, la description et les labels de tes sorties Strava, qui aident à reconnaître une course. Sans lui, la détection reste locale. Pour mettre en place le serveur, contacte le développeur.", Modifier.padding(bottom = 12.dp), size = 14)
         OutlinedTextField(url, { url = it }, Modifier.fillMaxWidth(), label = { Text("Adresse du serveur") }, placeholder = { Text("strava.home") }, singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri))
         OutlinedTextField(
@@ -196,8 +242,28 @@ private fun StravaCard(state: AppState, onOpen: (ActivityRow) -> Unit) {
             Muted("Analyse toutes tes sorties et propose les labels Strava (compétition, entraînement, sortie longue). Rien n'est modifié sans ta validation, sortie par sortie. Les titres et descriptions ne concernent que les prochaines séances.", Modifier.padding(top = 2.dp), size = 13)
             OutlinedButton({ state.checkStrava() }, Modifier.fillMaxWidth().padding(top = 8.dp), enabled = !state.checkBusy) { Text(if (state.checkBusy) "En cours…" else "Analyser les labels") }
             if (state.checkMessage.isNotEmpty()) Muted(state.checkMessage, Modifier.padding(top = 8.dp), size = 14)
+            Box(Modifier.padding(vertical = 12.dp).fillMaxWidth().height(1.dp).background(pal.border))
+            Text("Titre et description", fontWeight = FontWeight.SemiBold, color = pal.text, fontSize = 15.sp)
+            Muted("Teste l'écriture sur ta dernière sortie reliée à Strava : tu vois le texte avant l'envoi, et le serveur protège une description écrite par toi.", Modifier.padding(top = 2.dp), size = 13)
+            Row(Modifier.fillMaxWidth().padding(top = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                androidx.compose.material3.Switch(state.easyTexts, { state.chooseEasyTexts(it) })
+                Column(Modifier.padding(start = 12.dp)) {
+                    Text("Footings et sorties longues", color = pal.text, fontSize = 14.sp)
+                    Muted("Envoi automatique du titre et de la description, sans poser de label.", size = 12)
+                }
+            }
+            OutlinedButton({ testText = state.textTestCandidate(); testNone = testText == null }, Modifier.fillMaxWidth().padding(top = 8.dp)) { Text("Tester la modification") }
+            if (testNone) Muted("Aucune sortie récente n'est reliée à Strava.", Modifier.padding(top = 8.dp), size = 14)
+            if (state.textStatus.isNotEmpty()) Muted(state.textStatus, Modifier.padding(top = 8.dp), size = 14)
         }
         state.stravaSummary()?.let { Muted(it, Modifier.padding(top = 4.dp), size = 14) }
+        state.stravaEtat?.let { e ->
+            val last = e.lastSyncEnd?.let { runCatching { java.time.OffsetDateTime.parse(it).toInstant().toEpochMilli() }.getOrNull() }
+            Muted(
+                "Serveur ${e.version} · écriture ${if (e.writing) "active" else "en simulation"}" + (last?.let { " · dernière synchro ${Fmt.relative(it)}" } ?: "") + (if (e.fastUntil != null) " · mode rapide" else ""),
+                Modifier.padding(top = 4.dp), size = 13,
+            )
+        }
         Muted("Le trafic en clair n'est accepté que pour strava.home. La clé est stockée chiffrée.", Modifier.padding(top = 8.dp))
     }
 }

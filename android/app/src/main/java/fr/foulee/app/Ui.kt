@@ -79,11 +79,16 @@ fun FoldSection(title: String, subtitle: String? = null, openWhen: Boolean = fal
 
 /** A card that is folded until tapped: the page stays short, the detail is one tap away. */
 @Composable
-fun FoldCard(title: String, initiallyOpen: Boolean = false, content: @Composable ColumnScope.() -> Unit) {
+fun FoldCard(title: String, initiallyOpen: Boolean = false, badge: (@Composable () -> Unit)? = null, content: @Composable ColumnScope.() -> Unit) {
     var open by androidx.compose.runtime.saveable.rememberSaveable(title) { androidx.compose.runtime.mutableStateOf(initiallyOpen) }
     Card(
         title = title, onClick = { open = !open },
-        action = { Icon(if (open) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore, if (open) "Replier" else "Déplier", tint = LocalPal.current.muted) },
+        action = {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                badge?.invoke()
+                Icon(if (open) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore, if (open) "Replier" else "Déplier", Modifier.padding(start = 8.dp), tint = LocalPal.current.muted)
+            }
+        },
     ) { if (open) content() }
 }
 

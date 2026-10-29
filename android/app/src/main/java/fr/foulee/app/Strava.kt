@@ -50,6 +50,19 @@ object StravaSync {
         return if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) trimmed else "http://$trimmed"
     }
 
+    /** Set by the engine to write in the journal. */
+    var settingsLog: ((String) -> Unit)? = null
+
+    private fun addressPrefs() = NetworkDiagnostic.appContext?.getSharedPreferences("foulee_net", android.content.Context.MODE_PRIVATE)
+    private fun rememberedAddress(host: String) = addressPrefs()?.getString("ip_$host", null)
+
+    /** After a call that went through the normal way: keeps the address of the server, for the days when no DNS knows its name. */
+    private fun rememberAddress(base: String) {
+        val host = runCatching { java.net.URL(base).host }.getOrNull() ?: return
+        val ip = runCatching { java.net.InetAddress.getByName(host).hostAddress }.getOrNull() ?: return
+        if (ip != rememberedAddress(host)) addressPrefs()?.edit()?.putString("ip_$host", ip)?.apply()
+    }
+
     private fun get(base: String, key: String, path: String) = request("GET", base, key, path, null)
 
     fun post(base: String, key: String, path: String, body: String, readTimeoutMs: Int = 30_000) = request("POST", base, key, path, body, readTimeoutMs)
@@ -59,7 +72,20 @@ object StravaSync {
         val headers = mutableMapOf("Authorization" to "Bearer $key", "Accept" to "application/json")
         if (body != null) headers["Content-Type"] = "application/json"
         val response = try {
-            Http.request(method, base + path, headers, body, readTimeoutMs)
+            try {
+                Http.request(method, base + path, headers, body, readTimeoutMs).also { rememberAddress(base) }
+            } catch (e: java.net.UnknownHostException) {
+                // The system resolver gave up: ask the DNS servers of the network directly, then talk to the address (plain http only).
+                // Failing that, the last address this name had (a VPN address does not change) is used.
+                val url = java.net.URL(base)
+                if (url.protocol != "http") throw e
+                settingsLog?.invoke("le système ne trouve pas ${url.host} : résolution directe auprès des DNS du réseau")
+                val direct = NetworkDiagnostic.resolveDirect(url.host)
+                val ip = direct ?: rememberedAddress(url.host)
+                if (ip == null) throw e
+                if (direct == null) settingsLog?.invoke("aucun DNS ne connaît ${url.host} : j'utilise la dernière adresse connue, $ip")
+                Http.rawRequest(ip, if (url.port != -1) url.port else 80, url.host, method, path, headers, body, readTimeoutMs)
+            }
         } catch (e: IOException) {
             val host = runCatching { java.net.URL(base).host }.getOrDefault(base)
             throw StravaError(
@@ -116,7 +142,8 @@ object StravaSync {
         // The cursor moves only once everything received is in the base, and a null one keeps the old value
         if (!json.isNull("suivant")) json.optString("suivant").takeIf { it.isNotEmpty() && it != "null" }?.let { settings.stravaCursor = it }
         val session = json.optString("sessionStrava").takeIf { it.isNotEmpty() && it != "null" }
-        return Result(fetched.size, if (session != null && session != "connecte") SESSION_WARNING else null)
+        // "inconnu" lasts a few seconds after the server restarts: not a lost session
+        return Result(fetched.size, if (session == "deconnecte") SESSION_WARNING else null)
     }
 
     /** Strava's sport as a Garmin-style type key, so that the lists, icons and categories treat it like any other activity. */
@@ -146,13 +173,49 @@ object StravaSync {
         else -> label
     }
 
+    /** What the server holds for the outings modified since [sinceLocal] ("2026-10-27 20:50:24", local time, an hour of margin is taken). */
+    fun readBack(settings: Settings, sinceLocal: String): List<StravaActivity> {
+        val base = normalize(settings.stravaUrl) ?: throw StravaError("Pas d'adresse de serveur Strava.")
+        val key = settings.stravaKey ?: throw StravaError("Pas de clé pour le serveur Strava.")
+        val since = LocalDateTime.parse(sinceLocal.replace(' ', 'T')).minusHours(1).atZone(java.time.ZoneId.systemDefault()).toInstant().toString()
+        val items = get(base, key, "/api/activites?depuis=" + Http.encode(since)).optJSONArray("activites") ?: return emptyList()
+        return (0 until items.length()).mapNotNull { parse(items.getJSONObject(it)) }
+    }
+
+    class Etat(val version: String, val writing: Boolean, val session: String, val lastSyncEnd: String?, val nextSync: String?, val fastUntil: String?)
+
+    /** The state of the server (GET /api/etat, no Strava call on its side). Null when the server is older and has no such route. */
+    fun etat(settings: Settings): Etat? {
+        val base = normalize(settings.stravaUrl) ?: return null
+        val key = settings.stravaKey ?: return null
+        return try {
+            val j = get(base, key, "/api/etat")
+            fun s(o: JSONObject?, k: String) = o?.optString(k)?.takeIf { it.isNotEmpty() && it != "null" }
+            Etat(j.optString("version"), j.optBoolean("ecritureStrava", false), j.optString("sessionStrava", "inconnu"), s(j.optJSONObject("derniereSynchro"), "fin"), s(j, "prochaineSynchro"), s(j, "modeRapideJusqua"))
+        } catch (e: StravaError) {
+            null
+        }
+    }
+
+    /** Asks the server for a partial sync right now (POST /api/synchro): one call at the end of a run, the server then syncs every minute for 30 minutes. */
+    fun requestSync(settings: Settings): String {
+        val base = normalize(settings.stravaUrl) ?: throw StravaError("Pas d'adresse de serveur Strava.")
+        val key = settings.stravaKey ?: throw StravaError("Pas de clé pour le serveur Strava.")
+        return try {
+            val j = post(base, key, "/api/synchro", "{}", 20_000)
+            if (j.optBoolean("demarree")) "synchro demandée" else "une synchro tourne déjà"
+        } catch (e: StravaError) {
+            if (e.message?.contains("429") == true) "demande trop rapprochée (le serveur est déjà en mode rapide)" else throw e
+        }
+    }
+
     /** One call to see whether the address and the key work, without keeping anything. */
     fun test(url: String?, key: String?): String {
         val base = normalize(url) ?: throw StravaError("Adresse vide.")
         if (key.isNullOrBlank()) throw StravaError("Clé vide.")
         val json = get(base, key.trim(), "/api/activites?depuis=" + Http.encode(OffsetDateTime.now(ZoneOffset.UTC).toString()))
         return when (json.optString("sessionStrava")) {
-            "connecte", "" -> "Serveur joint, session Strava ouverte."
+            "connecte", "", "inconnu" -> "Serveur joint, session Strava ouverte."
             else -> SESSION_WARNING
         }
     }

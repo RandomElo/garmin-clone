@@ -27,6 +27,8 @@ class Step(val key: String, val label: String, val planned: Int, val rate: Doubl
     var count by mutableIntStateOf(0)
     var total by mutableIntStateOf(0)
     var error by mutableStateOf<String?>(null)
+    /** What the step did, in a few words, shown under its line when it went well. */
+    var note by mutableStateOf<String?>(null)
 
     /** Expected duration in seconds */
     val expected: Double get() = (if (total > 0) total else planned).coerceAtLeast(1) * rate
@@ -61,7 +63,7 @@ class Step(val key: String, val label: String, val planned: Int, val rate: Doubl
 }
 
 /** Seconds per item (or per step for the one-call steps) before any sync was measured. */
-private val defaultRates = mapOf("auth" to 2.0, "activities" to 0.015, "details" to 0.2, "wellness" to 0.55, "fitness" to 4.0, "strava" to 3.0)
+private val defaultRates = mapOf("auth" to 2.0, "activities" to 0.015, "details" to 0.2, "wellness" to 0.55, "fitness" to 4.0, "strava" to 3.0, "detect" to 0.5, "texts" to 3.0)
 
 /** Live state of the sync in progress, read by the screens. */
 class RunState(val mode: String, val trigger: String, val startedAt: Long, plan: Map<String, Int>, settings: Settings) {
@@ -71,7 +73,9 @@ class RunState(val mode: String, val trigger: String, val startedAt: Long, plan:
         step("details", "Courbes et tracés GPS", plan, settings),
         step("wellness", "Santé (sommeil, VFC…)", plan, settings),
         step("fitness", "Forme (VO2 max, statut)", plan, settings),
-        step("strava", "Strava (textes et labels)", plan, settings),
+        step("strava", "Strava (import des sorties)", plan, settings),
+        step("detect", "Détection des séances", plan, settings),
+        step("texts", "Envoi des textes à Strava", plan, settings),
     )
 
     // A "today" sync and a "full" one do not cost the same per item (few big calls against many small ones): each keeps its own pace
@@ -121,6 +125,8 @@ object SyncEngine {
         )
         val state = RunState(mode, trigger, System.currentTimeMillis(), plan, settings)
         current = state
+        StravaSync.settingsLog = { db.addLog("W", "strava", it) }
+        db.addLog("I", "synchro", "début : $mode, déclenchée par $trigger, prévu ${plan.entries.joinToString(", ") { "${it.key} ${it.value}" }}")
         val (authStep, activitiesStep, detailsStep, wellnessStep, fitnessStep) = state.steps
         var newActivities = 0
         var days = 0
@@ -228,7 +234,44 @@ object SyncEngine {
                 }
             }
 
+            // The runs of the last days, sorted: what was found and what goes to Strava
+            val detectStep = state.steps[6]
+            if (fatal || (trigger == "auto" && newActivities == 0)) {
+                detectStep.status = "skipped"
+            } else {
+                detectStep.status = "running"
+                try {
+                    val since = java.time.LocalDate.now().minusDays(3).toString()
+                    val recent = db.activities().filter { it.isRun && it.startLocal.take(10) >= since }
+                    detectStep.note = if (recent.isEmpty()) "aucune course ces 3 derniers jours" else recent.groupingBy { Categories.label(it.category).lowercase() }.eachCount().entries.joinToString(", ") { "${it.value} ${it.key}" }
+                    detectStep.status = "success"
+                } catch (e: Exception) {
+                    detectStep.status = "skipped"
+                    detectStep.error = e.message ?: e.javaClass.simpleName
+                }
+            }
+
+            // Titles and descriptions of the new sessions: never makes the sync fail either
+            val textsStep = state.steps[7]
+            if (settings.stravaUrl.isNullOrBlank() || settings.stravaKey == null || state.steps[5].status != "success") {
+                textsStep.status = "skipped"
+            } else {
+                textsStep.status = "running"
+                try {
+                    textsStep.note = StravaTexts.push(settings, db)?.substringAfter(" : ") ?: "rien de nouveau à envoyer"
+                    textsStep.status = "success"
+                } catch (e: Exception) {
+                    textsStep.status = "skipped"
+                    textsStep.error = e.message ?: e.javaClass.simpleName
+                }
+            }
+
             state.steps.forEach { it.recordRate(settings) }
+            state.steps.filter { it.status != "pending" }.forEach {
+                val seconds = if (it.finishedAt > it.startedAt) " en ${(it.finishedAt - it.startedAt) / 1000.0} s" else ""
+                val level = if (it.status == "error") "E" else if (it.error != null) "W" else "I"
+                db.addLog(level, "synchro", "${it.key} : ${it.status}$seconds${if (it.total > 0) ", ${it.count}/${it.total}" else ""}${it.note?.let { n -> " ($n)" } ?: ""}${it.error?.let { e -> " : $e" } ?: ""}")
+            }
             val failed = state.steps.count { it.status == "error" }
             val status = when {
                 failed == 0 -> "success"
@@ -240,7 +283,11 @@ object SyncEngine {
             if (trigger != "auto" || newActivities > 0 || status != "success") {
                 db.addRun(RunRecord(state.startedAt, System.currentTimeMillis(), mode, trigger, status, state.steps.firstOrNull { it.error != null }?.error, newActivities, days))
             }
+            db.addLog(if (status == "success") "I" else "W", "synchro", "fin : $status en ${(System.currentTimeMillis() - state.startedAt) / 1000.0} s, $newActivities nouvelle(s) activité(s)")
             return status
+        } catch (e: Exception) {
+            db.addLog("E", "synchro", "interrompue : ${e.javaClass.simpleName}: ${e.message}")
+            throw e
         } finally {
             current = null
             lock.set(false)
